@@ -403,7 +403,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
+		// v0.5.18+connfix: DisableKeepAlives forces "Connection: close" on every
+		// request. Something on the live replicate path occasionally abandons a
+		// response body without closing it; with keep-alives the pinned conn
+		// (1 fd + readLoop/writeLoop goroutines) is never reaped and they
+		// accumulate until the host OOMs (observed: ~10k conns/7h against B2).
+		// With Connection: close the server closes each conn after its response,
+		// so the transport reaps the fd and goroutines even if the body is never
+		// closed. Cost is one TLS handshake per request, which is fine at the
+		// observed request rate (~1/s). Drop this when upstream fixes the leak.
+		DisableKeepAlives:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
