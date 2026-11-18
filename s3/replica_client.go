@@ -389,10 +389,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create HTTP client with 24 hour timeout for long-running operations
-	httpClient := &http.Client{
-		Timeout: 24 * time.Hour,
-	}
+	// v0.5.18+connfix: no Client.Timeout. A nonzero Timeout spawns a
+	// setRequestCancel goroutine per request that only exits when the response
+	// body is closed; bodies abandoned on the replicate path pinned one
+	// goroutine each (observed ~20k goroutines / 7h). Litestream passes
+	// contexts with its own deadlines and ResumableReader has stall detection,
+	// so a client-wide timeout is unnecessary.
+	httpClient := &http.Client{}
 
 	// Always configure custom HTTP Transport with controlled keepalive settings
 	// to reduce idle CPU usage from default transport's aggressive keepalives.
