@@ -403,21 +403,21 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		// v0.5.18+connfix: DisableKeepAlives forces "Connection: close" on every
-		// request. Something on the live replicate path occasionally abandons a
-		// response body without closing it; with keep-alives the pinned conn
-		// (1 fd + readLoop/writeLoop goroutines) is never reaped and they
-		// accumulate until the host OOMs (observed: ~10k conns/7h against B2).
-		// With Connection: close the server closes each conn after its response,
-		// so the transport reaps the fd and goroutines even if the body is never
-		// closed. Cost is one TLS handshake per request, which is fine at the
-		// observed request rate (~1/s). Drop this when upstream fixes the leak.
-		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+
+	// v0.5.18+connfix: wrap the transport so any response body that sits unread
+	// for bodyIdleTimeout is force-closed. The compactor opens all source LTX
+	// streams upfront and some are abandoned without Close, pinning one
+	// connection (1 fd + readLoop/writeLoop goroutines) each until process
+	// death — observed ~10k leaked B2 conns/7h until the host OOMs. Callers
+	// that still need the body (ResumableReader) survive the forced close:
+	// the next Read errors and they reconnect from the current offset.
+	httpClient.Transport = &idleCloseTransport{base: httpClient.Transport}
 
 	// Configure TLS to skip verification if requested
 	if c.SkipVerify {
@@ -922,6 +922,65 @@ func (c *ReplicaClient) putObjectInput(key string, timestamp time.Time) *s3.PutO
 
 	return input
 }
+
+// v0.5.18+connfix: idleCloseTransport force-closes response bodies that sit
+// unread for bodyIdleTimeout, reaping connections abandoned by callers that
+// forget Body.Close (observed on the replicate path: compactor source streams).
+const bodyIdleTimeout = 30 * time.Second
+
+type idleCloseTransport struct {
+	base http.RoundTripper
+}
+
+func (t *idleCloseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		return resp, err
+	}
+	resp.Body = newIdleCloseBody(resp.Body, bodyIdleTimeout)
+	return resp, nil
+}
+
+type idleCloseBody struct {
+	rc     io.ReadCloser
+	idle   time.Duration
+	mu     sync.Mutex
+	timer  *time.Timer
+	closed bool
+}
+
+func newIdleCloseBody(rc io.ReadCloser, idle time.Duration) *idleCloseBody {
+	b := &idleCloseBody{rc: rc, idle: idle}
+	b.mu.Lock()
+	b.timer = time.AfterFunc(idle, b.forceClose)
+	b.mu.Unlock()
+	return b
+}
+
+func (b *idleCloseBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if b.timer != nil && !b.closed {
+		b.timer.Reset(b.idle)
+	}
+	b.mu.Unlock()
+	return b.rc.Read(p)
+}
+
+func (b *idleCloseBody) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	b.mu.Unlock()
+	return b.rc.Close()
+}
+
+func (b *idleCloseBody) forceClose() { _ = b.Close() }
 
 func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
