@@ -1017,6 +1017,33 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 		// calls GetRawResponse, so drop the middleware entirely.
 		_, _ = stack.Deserialize.Remove("AddRawResponseToMetadata")
 
+		// v0.5.18+connfix9: force a fresh connection per request. Even with
+		// ResultMetadata cleared (connfix8), same-process profile diffs show
+		// ~66% of live heap in tls.Conn read buffers that balloon to the
+		// largest body read on a conn and are retained by the pooled
+		// persistConn after it returns to the transport's idle pool. Setting
+		// Request.Close makes net/http discard the underlying conn as soon as
+		// the body is consumed, so all per-conn TLS/bufio state becomes
+		// collectible garbage instead of pool-pinned live heap. TLS handshake
+		// cost per request is acceptable at litestream's API rate (a handful
+		// of calls per interval, see B2 Class C budget in litestream.yml).
+		if err := stack.Build.Add(
+			middleware.BuildMiddlewareFunc(
+				"LitestreamForceConnClose",
+				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+					middleware.BuildOutput, middleware.Metadata, error,
+				) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok && req.Request != nil {
+						req.Request.Close = true
+					}
+					return next.HandleBuild(ctx, in)
+				},
+			),
+			middleware.Before,
+		); err != nil {
+			return err
+		}
+
 		if c.RequireContentMD5 {
 			if err := stack.Serialize.Add(
 				middleware.SerializeMiddlewareFunc(
