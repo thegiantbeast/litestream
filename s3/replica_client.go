@@ -406,9 +406,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2: true,
+		// v0.5.18+connfix: keep-alives disabled. Pooled idle connections pin
+		// their TLS read buffers (rawInput grows with large ListObjectsV2/GET
+		// bodies and never shrinks), which was the steady-state heap leak that
+		// OOM-recycled the container at its memory limit every few hours.
+		// A fresh conn per request costs one TLS handshake (~2-5 req/s here).
+		DisableKeepAlives:     true,
+		MaxIdleConns:          2,
+		IdleConnTimeout:       5 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
