@@ -1006,6 +1006,17 @@ func (b *idleCloseBody) forceClose() { _ = b.Close() }
 
 func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
+		// v0.5.18+connfix: the SDK's AddRawResponseToMetadata middleware copies
+		// the raw *smithyhttp.Response into middleware.Metadata, and generated
+		// clients assign that metadata to out.ResultMetadata. That keeps every
+		// operation output referencing Response->Body->persistConn->tls.Conn —
+		// and tls.Conn.rawInput balloons to the largest response read on the
+		// conn and never shrinks (go1.26 readFromUntil). Retained outputs then
+		// pin ~MiB of TLS state per request (observed ~5 MiB/min heap growth,
+		// OOM cycles at a 2 GiB limit, fds/goroutines flat). Litestream never
+		// calls GetRawResponse, so drop the middleware entirely.
+		_, _ = stack.Deserialize.Remove("AddRawResponseToMetadata")
+
 		if c.RequireContentMD5 {
 			if err := stack.Serialize.Add(
 				middleware.SerializeMiddlewareFunc(
