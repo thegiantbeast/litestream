@@ -935,7 +935,7 @@ func (c *ReplicaClient) putObjectInput(key string, timestamp time.Time) *s3.PutO
 // v0.5.18+connfix: idleCloseTransport force-closes response bodies that sit
 // unread for bodyIdleTimeout, reaping connections abandoned by callers that
 // forget Body.Close (observed on the replicate path: compactor source streams).
-const bodyIdleTimeout = 30 * time.Second
+const bodyIdleTimeout = 5 * time.Second
 
 type idleCloseTransport struct {
 	base http.RoundTripper
@@ -972,7 +972,15 @@ func (b *idleCloseBody) Read(p []byte) (int, error) {
 		b.timer.Reset(b.idle)
 	}
 	b.mu.Unlock()
-	return b.rc.Read(p)
+	n, err := b.rc.Read(p)
+	if err == io.EOF {
+		// v0.5.18+connfix: a fully-read body must release the connection
+		// immediately. Callers that abandon a body without Close otherwise
+		// pin the persistConn (fd + readLoop/writeLoop + TLS buffers) until
+		// the idle timer fires.
+		_ = b.Close()
+	}
+	return n, err
 }
 
 func (b *idleCloseBody) Close() error {
