@@ -145,11 +145,23 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			}
 		}
 
-		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("open ltx file: %w", err)
+		// v0.5.18+connfix10: wrap the source stream in an idle-drop reader.
+		// ltx.Compactor decodes ALL source headers upfront, so with a large
+		// L0 backlog (v0.5.18 emitted one tiny L0 file per sync; an unpruned
+		// bucket reached ~155k objects) >100k streams stay alive — and each
+		// closed/idle conn's tls.Conn/bufio/handshake allocations remain
+		// referenced by the retained reader chain for the whole pass. That
+		// was hundreds of MB of LIVE heap with flat fds (OOM at 2 GiB within
+		// the first hours of every attempt; maxL1TXID stuck; L0 retention
+		// could never delete anything). Dropping idle streams after 5s
+		// releases the whole object chain; reads re-open transparently.
+		{
+			rc, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+			if err != nil {
+				return nil, fmt.Errorf("open ltx file: %w", err)
+			}
+			rdrs = append(rdrs, internal.NewIdleDropReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, rc, c.logger, internal.CompactionIdleDropTimeout))
 		}
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction

@@ -1015,34 +1015,12 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 		// pin ~MiB of TLS state per request (observed ~5 MiB/min heap growth,
 		// OOM cycles at a 2 GiB limit, fds/goroutines flat). Litestream never
 		// calls GetRawResponse, so drop the middleware entirely.
+		// v0.5.18+connfix10: connfix9's per-request Close was reverted — with
+		// the compactor no longer pinning >100k streams (see
+		// compactor_buffered.go), the bounded keep-alive pool is safe again
+		// and reusing warm conns roughly halves per-request latency on the
+		// compaction backfill path. ResultMetadata removal (connfix8) is kept.
 		_, _ = stack.Deserialize.Remove("AddRawResponseToMetadata")
-
-		// v0.5.18+connfix9: force a fresh connection per request. Even with
-		// ResultMetadata cleared (connfix8), same-process profile diffs show
-		// ~66% of live heap in tls.Conn read buffers that balloon to the
-		// largest body read on a conn and are retained by the pooled
-		// persistConn after it returns to the transport's idle pool. Setting
-		// Request.Close makes net/http discard the underlying conn as soon as
-		// the body is consumed, so all per-conn TLS/bufio state becomes
-		// collectible garbage instead of pool-pinned live heap. TLS handshake
-		// cost per request is acceptable at litestream's API rate (a handful
-		// of calls per interval, see B2 Class C budget in litestream.yml).
-		if err := stack.Build.Add(
-			middleware.BuildMiddlewareFunc(
-				"LitestreamForceConnClose",
-				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
-					middleware.BuildOutput, middleware.Metadata, error,
-				) {
-					if req, ok := in.Request.(*smithyhttp.Request); ok && req.Request != nil {
-						req.Request.Close = true
-					}
-					return next.HandleBuild(ctx, in)
-				},
-			),
-			middleware.Before,
-		); err != nil {
-			return err
-		}
 
 		if c.RequireContentMD5 {
 			if err := stack.Serialize.Add(

@@ -283,6 +283,20 @@ func (r *ResumableReader) setStream(rc io.ReadCloser, cancel context.CancelFunc)
 // next read reopens from the current offset. The stream is already being
 // discarded, so a close error should not stop recovery. Log it only to aid
 // debugging.
+// Drop closes and clears the current underlying stream so the next Read
+// re-opens from the current offset. Used by IdleDropReader to release the
+// stream (and everything it pins) when the compactor leaves a source idle
+// for a long stretch; a subsequent Read transparently re-opens.
+func (r *ResumableReader) Drop() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	r.dropStream()
+}
+
 func (r *ResumableReader) dropStream() {
 	r.mu.Lock()
 	rc, cancel := r.rc, r.cancel
