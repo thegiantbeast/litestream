@@ -12,7 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"runtime/pprof"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -442,6 +447,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
+	// v0.5.18+connfix: memory diagnostics watchdog. LITESTREAM_MEMPROFILE_RATE
+	// lowers runtime.MemProfileRate so heap profiles resolve small retainers;
+	// LITESTREAM_HEAP_WATCHDOG_MB dumps a heap profile and returns free memory to
+	// the OS when heap in-use crosses the threshold.
+	startMemWatchdog(ctx)
+
 	// Serve metrics over HTTP if enabled.
 	if c.Config.Addr != "" {
 		hostport := c.Config.Addr
@@ -663,4 +674,46 @@ start, stop, sync, register, unregister, info, and list. Enable it in the config
 	  path: /tmp/litestream.sock
 
 `[1:], DefaultConfigPath())
+}
+
+// startMemWatchdog enables fine-grained heap profiling and a heap watchdog for
+// v0.5.18+connfix deployments. Both knobs are off unless env vars are set.
+func startMemWatchdog(ctx context.Context) {
+	if v := os.Getenv("LITESTREAM_MEMPROFILE_RATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runtime.MemProfileRate = n
+			slog.Info("memprofile rate set", "bytes", n)
+		}
+	}
+	limitMB := int64(1536)
+	if v := os.Getenv("LITESTREAM_HEAP_WATCHDOG_MB"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			limitMB = n
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			if m.HeapInuse <= uint64(limitMB)*1024*1024 {
+				continue
+			}
+			slog.Warn("heap watchdog: heap in-use over threshold",
+				"heapInuseMB", m.HeapInuse/1024/1024, "limitMB", limitMB)
+			path := fmt.Sprintf("/tmp/litestream-heap-%d.pprof", time.Now().Unix())
+			if f, err := os.Create(path); err == nil {
+				_ = pprof.WriteHeapProfile(f)
+				_ = f.Close()
+				slog.Warn("heap watchdog: profile written", "path", path)
+			}
+			debug.FreeOSMemory()
+		}
+	}()
 }

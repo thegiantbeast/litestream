@@ -400,7 +400,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Always configure custom HTTP Transport with controlled keepalive settings
 	// to reduce idle CPU usage from default transport's aggressive keepalives.
 	// See: https://github.com/benbjohnson/litestream/issues/992
-	httpClient.Transport = &http.Transport{
+	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -413,6 +413,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Configure TLS to skip verification if requested
+	if c.SkipVerify {
+		tr.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
 	// v0.5.18+connfix: wrap the transport so any response body that sits unread
 	// for bodyIdleTimeout is force-closed. The compactor opens all source LTX
 	// streams upfront and some are abandoned without Close, pinning one
@@ -420,14 +427,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// death — observed ~10k leaked B2 conns/7h until the host OOMs. Callers
 	// that still need the body (ResumableReader) survive the forced close:
 	// the next Read errors and they reconnect from the current offset.
-	httpClient.Transport = &idleCloseTransport{base: httpClient.Transport}
-
-	// Configure TLS to skip verification if requested
-	if c.SkipVerify {
-		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
-	}
+	httpClient.Transport = &idleCloseTransport{base: tr}
 
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
@@ -1736,6 +1736,7 @@ func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
 // Close stops iteration and returns any error that occurred during iteration.
 func (itr *fileIterator) Close() (err error) {
 	itr.closed = true
+	itr.page = nil // v0.5.18+connfix: release the last page eagerly
 	itr.cancel()
 	return itr.err
 }
@@ -1753,6 +1754,10 @@ func (itr *fileIterator) Next() bool {
 			if !itr.paginator.HasMorePages() {
 				return false
 			}
+
+			// v0.5.18+connfix: release the consumed page before fetching the next
+			// so a retained iterator cannot pin every deserialized page.
+			itr.page = nil
 
 			var err error
 			itr.page, err = itr.paginator.NextPage(itr.ctx)
