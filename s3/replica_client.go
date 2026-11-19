@@ -407,14 +407,19 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2: true,
-		// v0.5.18+connfix: keep-alives disabled. Pooled idle connections pin
-		// their TLS read buffers (rawInput grows with large ListObjectsV2/GET
-		// bodies and never shrinks), which was the steady-state heap leak that
-		// OOM-recycled the container at its memory limit every few hours.
-		// A fresh conn per request costs one TLS handshake (~2-5 req/s here).
-		DisableKeepAlives:     true,
-		MaxIdleConns:          2,
-		IdleConnTimeout:       5 * time.Second,
+		// v0.5.18+connfix: bounded keep-alive pool. tls.Conn.rawInput balloons
+		// to the largest response body read on that conn (go1.26 readFromUntil
+		// reads into all spare capacity; bytes.Buffer never shrinks), and those
+		// buffers stay live via the response->body->persistConn chain. With
+		// keep-alives disabled every request reallocated ~150-400KB of TLS
+		// state and retained it (~5 MiB/min -> OOM every ~3h at the 2G limit).
+		// A small pool amortizes TLS state and caps retained buffers at
+		// pool size x max response; idleCloseBody (below) still reaps sockets
+		// whose bodies were never closed.
+		DisableKeepAlives:     false,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       10 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
